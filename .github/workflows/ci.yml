@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 0.15.x
+      - freeBSD-test
   pull_request:
     branches:
       - main
@@ -160,114 +161,95 @@ jobs:
   build-freebsd:
     runs-on: ubuntu-latest
     name: FreeBSD Build and Test
+    strategy:
+      matrix:
+        compiler: [clang]
+        build_type: [Debug, Release]
+      fail-fast: false
+
     steps:
-        - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Install QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            libvirt-daemon-system \
+            libvirt-clients \
+            bridge-utils
+          sudo systemctl start libvirtd
 
-        - name: Install QEMU dependencies
-          run: |
-            sudo apt-get update
-            sudo apt-get install -y \
-              qemu-system-x86 \
-              qemu-utils \
-              libvirt-daemon-system \
-              libvirt-clients \
-              bridge-utils
-            sudo systemctl start libvirtd
+      - name: Setup FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        id: freebsd-vm
+        with:
+          release: "14.2"
+          usesh: true
+          envs: "PATH,GITHUB_ENV,GITHUB_WORKSPACE,RUNNER_USER"
+          mem: 6144
+          sync: rsync
+          copyback: true
+          prepare: |
+            # System bootstrap
+            ASSUME_ALWAYS_YES=yes pkg bootstrap
+            pkg update
+            pkg upgrade -y
 
-        - name: Setup FreeBSD VM
-          uses: vmactions/freebsd-vm@v1
-          id: freebsd-vm
-          with:
-            release: "14.2"
-            usesh: true
-            envs: "PATH,GITHUB_ENV,GITHUB_WORKSPACE"
-            mem: 6144
-            sync: rsync
-            copyback: true
-            prepare: |
-              # System setup
-              pkg update -y
-              pkg install -y \
-                libev \
-                cmake \
-                clang \
-                postgresql17-server \
-                postgresql17-contrib \
-                zstd \
-                lz4 \
-                bzip2 \
-                libssh \
-                libarchive \
-                check \
-                python3-docutils \
-                doxygen \
-                graphviz \
-                net-tools
+            # Base dependencies
+            pkg install -y \
+              bash \
+              sudo \
+              libev \
+              cmake \
+              llvm11 \
+              postgresql17-server \
+              postgresql17-contrib \
+              zstd \
+              liblz4 \
+              bzip2 \
+              libssh \
+              libarchive \
+              check \
+              py311-docutils \
+              curl \
+              doxygen \
+              hs-pandoc \
+              texlive-base \
+              texlive-texmf \
+              graphviz 
 
-              # Configure SSH for localhost resolution
-              echo "127.0.0.1 freebsd" >> /etc/hosts
-              sysrc sshd_enable=YES
-              service sshd start
+      - name: Build Project
+        shell: freebsd {0}
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/build
+          cd $GITHUB_WORKSPACE/build
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} "$GITHUB_WORKSPACE"
+          make -j$(sysctl -n hw.ncpu)
 
-              # PostgreSQL initialization
-              sysrc postgresql_enable=YES
-              service postgresql initdb
-              service postgresql start
+      - name: Check Bash
+        shell: freebsd {0}
+        run: which bash
+        
 
-        - name: Configure PostgreSQL
-          shell: freebsd {0}
-          run: |
-            echo "wal_level = replica" >> /var/db/postgres/data17/postgresql.conf
-            echo "host replication repl 127.0.0.1/32 md5" >> /var/db/postgres/data17/pg_hba.conf
-            service postgresql restart
-            sudo -u postgres psql -c "CREATE ROLE repl WITH LOGIN REPLICATION PASSWORD 'secretpassword';"
-            sudo -u postgres psql -c "SELECT pg_create_physical_replication_slot('repl', true, false);"
-        - name: CLANG/mkdir
-          shell: freebsd {0}
-          run: mkdir build
-          working-directory: ${{ github.workspace }}
+      - name: Debug Testsuite Path
+        shell: freebsd {0}
+        run: |
+          cd "${GITHUB_WORKSPACE}/build"
+          bash ./testsuite.sh 
 
-        - name: CLANG/cmake
-          shell: freebsd {0}
-          run: cmake -DCMAKE_BUILD_TYPE=Debug ..
-          working-directory: ${{ github.workspace }}/build
+      - name: Clean Testsuite
+        shell: freebsd {0}
+        run: |
+          cd ${GITHUB_WORKSPACE}/build
+          bash ./testsuite.sh clean
 
-        - name: CLANG/make
-          shell: freebsd {0}
-          run: make -j$(sysctl -n hw.ncpu)
-          working-directory: ${{ github.workspace }}/build
-
-        - name: CLANG/Testsuite
-          id: clang-test
-          shell: freebsd {0}
-          run: ./testsuite.sh
-          working-directory: ${{ github.workspace }}/build
-
-        - name: CLANG/Testsuite Clean
-          shell: freebsd {0}
-          run: ./testsuite.sh clean
-          working-directory: ${{ github.workspace }}/build
-
-        - name: CLANG/rm -Rf
-          shell: freebsd {0}
-          run: rm -Rf build
-          working-directory: ${{ github.workspace }}
-
-        - name: Show logs on failure
-          if: failure() && steps.clang-test.outcome == 'failure'
-          shell: freebsd {0}
-          run: |
-            cat ./log/logfile || echo "logfile not found"
-            cat ./log/pgmoneta.log || echo "pgmoneta.log not found"
-            ./testsuite.sh clean
-          working-directory: ${{ github.workspace }}/build
-
-        - name: Upload logs on failure
-          if: failure()
-          uses: actions/upload-artifact@v4
-          with:
-            name: freebsd-logs
-            path: |
-              ${{ github.workspace }}/build/log/*
-              /tmp/*.log
-            retention-days: 7
+      - name: Upload Build Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ matrix.compiler }}-${{ matrix.build_type }}-logs
+          path: |
+            $GITHUB_WORKSPACE/build/log/*
+            /tmp/*.log
+          retention-days: 90
